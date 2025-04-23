@@ -1,0 +1,124 @@
+% Pivers Island Mesh
+% Alejandra Rios
+% 2024 - 2025
+
+%NOTE: Replace if obj.demfile ~=0 at line 164 to if ~is empty(obj.demfile) at line 164 in @geodata function
+
+clearvars;  % Clear all variables from workspace
+clc;         % Clear command window
+close all    % Close all figures
+
+PREFIX = 'PiversIsland';  % Prefix for output files
+
+% Add necessary paths for OceanMesh2D utilities
+addpath(genpath("C:\OceanMesh2D-Projection"));
+addpath(genpath("C:\OceanMesh2D-Projection\geodata"));
+addpath(genpath("C:\OceanMesh2D-Projection\msh"));
+addpath(genpath("C:\OceanMesh2D-Projection\meshgen"));
+addpath(genpath("C:\OceanMesh2D-Projection\utilities"));
+
+%% STEP 1: Set mesh parameters
+min_el = 1; max_el = 300; max_el_ns = 30; dt = 2; grade = 0.15; R = 3;
+
+%% STEP 2: Read coastline shapefile
+coastline = "C:\OceanMesh2D-Projection\datasets\pivers_island\noaa_coastline\N30W080.shp";
+info = shapeinfo(coastline);
+disp(info.CoordinateReferenceSystem);
+
+%% STEP 3: Read and explore original DEM
+% Load data from WGS84 NetCDF
+
+% Define file path
+ncfile = "D:\RiosA_PiversIsland_DigitalData\piversisland_topobathy_wgs84.nc";
+
+% Load variables
+lat = ncread(ncfile, 'lat');
+lon = ncread(ncfile, 'lon');
+dem_data = ncread(ncfile, 'Band1');
+
+% Handle NoData values
+dem_data(dem_data == -999999) = NaN;
+dem_data = dem_data';  % Transpose to align rows with latitudes
+
+%% STEP 4: Fill and smooth DEM
+nan_count_before = sum(isnan(dem_data(:)));
+dem_data = inpaint_nans(dem_data, 4);  % Bilinear
+kernel = fspecial('average', [3 3]);
+dem_data = conv2(dem_data, kernel, 'same');
+dem_data(dem_data > 10) = NaN;
+dem_data = inpaint_nans(dem_data, 4);  % Bilinear again
+
+% Final pass with nearest neighbor
+for i = 1:5
+    if all(~isnan(dem_data(:))), break; end
+    dem_data = inpaint_nans(dem_data, 0);
+end
+
+nan_count_after = sum(isnan(dem_data(:)));
+
+% Meshgrid to support interpolation
+[X, Y] = meshgrid(lon, lat);
+
+% Plot DEM
+figure;
+imagesc(lon, lat, dem_data);
+axis xy; colorbar;
+title('Cleaned DEM');
+
+%% STEP 5: Write cleaned DEM to NetCDF
+output_nc = "C:\OceanMesh2D-Projection\datasets\pivers_island\pivers_island_dem\pivers_dem_filled.nc";
+if isfile(output_nc), delete(output_nc); end
+nccreate(output_nc, 'x', 'Dimensions', {'x', length(lon)});
+nccreate(output_nc, 'y', 'Dimensions', {'y', length(lat)});
+nccreate(output_nc, 'z', 'Dimensions', {'x', length(lon), 'y', length(lat)}, 'Datatype', 'single');
+
+ncwrite(output_nc, 'x', lon);
+ncwrite(output_nc, 'y', lat);
+ncwrite(output_nc, 'z', single(dem_data'));
+
+%% STEP 6: Bounding box
+bbox = [min(lon), max(lon); min(lat), max(lat)];
+
+%% STEP 7: Create geodata and edge function
+geo = geodata('shp', coastline, 'dem', output_nc, 'bbox', bbox, 'h0', min_el);
+ef = edgefx('geodata', geo, 'fs', R, 'max_el_ns', max_el_ns, 'max_el', max_el, 'dt', dt, 'g', grade);
+
+%% STEP 8: Mesh generation
+opts = meshgen('ef', ef, 'bou', geo, 'plot_on', 1);
+opts = opts.build;
+
+%% STEP 9: Interpolate bathymetry and attach to mesh
+m = opts.grd;
+m.x = m.p(:,1);
+m.y = m.p(:,2);
+bathymetry = interp2(X, Y, dem_data, m.x, m.y, 'linear');
+bathymetry(isnan(bathymetry)) = 0;
+m = setfield(m, 'z', bathymetry);
+
+%% STEP 10: Clean, filter, and analyze mesh
+m = make_bc(m, 'auto', geo, 'depth', 7.5);
+m = clean(m, 'mqa', 0.5, 'db', 0.2, 'djc', 0.2, 'con', 6, 'projL', 1);
+m.z(isnan(m.z)) = 0;  % fill any remaining NaNs
+
+areas = triarea(m.x, m.y, m.e);
+m.e = m.e(areas > 1, :);  % remove small triangles
+q = meshqual(m);
+m.e = m.e(q > 0.05, :);   % keep high-quality triangles
+m = clean(m, 'mqa', 0.3, 'db', 0.2, 'djc', 0.2, 'con', 6, 'projL', 1);
+m.f13 = q;  % store quality values
+
+%% STEP 11: Plot and export
+figure; plot(m, 'type', 'bd');
+figure; plot(m, 'type', 'blog'); set(gca, 'YDir', 'normal');
+figure; plot(m, 'type', 'mq'); colorbar;
+
+% Save figures
+figs = get(0, 'children');
+for i = 1:length(figs)
+    print(figs(i).Number, sprintf('%s_plot%i', PREFIX, figs(i).Number), '-dpng', '-r200');
+end
+
+% Save .mat and fort.14 files
+save(sprintf('%s_msh.mat', PREFIX), 'm');
+write(m, sprintf('%s_mesh', PREFIX));
+write(m, fullfile('D:\ADCIRC-Live-v56.0.2-gfortran-9', 'fort'));
